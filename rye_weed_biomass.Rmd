@@ -1,0 +1,845 @@
+---
+title: "Rye weed biomass"
+
+output:
+  github_document:
+    toc: true
+always_allow_html: true
+
+
+---
+
+#Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.path = "figs/analysis/rye_weed_biomass-"
+)
+```
+
+# Packages
+```{r}
+# Packages ---------------------------------------------------------------
+library(tidyverse)    # dplyr, ggplot2, readr, tibble, etc.
+library(janitor)
+library(readxl)
+library(glmmTMB)
+library(DHARMa)
+library(emmeans)
+library(multcomp)
+library(car)
+library(kableExtra)
+library(here)
+library(conflicted)
+library(lme4)
+library(WrensBookshelf)
+
+# Handle conflicts
+conflicts_prefer(dplyr::select)
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::recode)
+
+# ------------------------------------------------------------------------
+# Treatment level order (use everywhere)
+# ------------------------------------------------------------------------
+
+# Main plot: primary tillage
+primary_tillage_levels <- c(
+  "Chisel plow",
+  "Moldboard plow",
+  "No-till"
+)
+
+# Subplot: number of field cultivation passes
+fc_levels <- c("1 FC", "2 FC", "3 FC", "4 FC")
+
+# Sub subplot: rye seeding rate
+rye_rate_levels <- c("Low", "High")
+
+# Combined treatment levels for tilled factorial (primary tillage × FC)
+fsb_trt_levels <- c(
+  "Chisel plow, 1 FC",
+  "Chisel plow, 2 FC",
+  "Chisel plow, 3 FC",
+  "Chisel plow, 4 FC",
+  "Moldboard plow, 1 FC",
+  "Moldboard plow, 2 FC",
+  "Moldboard plow, 3 FC",
+  "Moldboard plow, 4 FC"
+)
+
+# Combined treatment levels for full 3 way (primary × FC × rye rate)
+fsb_trt_rye_levels <- c(
+  "Chisel plow, 1 FC, Low",
+  "Chisel plow, 1 FC, High",
+  "Chisel plow, 2 FC, Low",
+  "Chisel plow, 2 FC, High",
+  "Chisel plow, 3 FC, Low",
+  "Chisel plow, 3 FC, High",
+  "Chisel plow, 4 FC, Low",
+  "Chisel plow, 4 FC, High",
+  "Moldboard plow, 1 FC, Low",
+  "Moldboard plow, 1 FC, High",
+  "Moldboard plow, 2 FC, Low",
+  "Moldboard plow, 2 FC, High",
+  "Moldboard plow, 3 FC, Low",
+  "Moldboard plow, 3 FC, High",
+  "Moldboard plow, 4 FC, Low",
+  "Moldboard plow, 4 FC, High"
+)
+
+# ------------------------------------------------------------------------
+# Color palettes (WrensBookshelf) using LittleBlueHouseBesideTheSea1
+# ------------------------------------------------------------------------
+
+# Primary tillage colors
+primary_tillage_cols <- WB_brewer(
+  name = "LittleBlueHouseBesideTheSea1",
+  n    = length(primary_tillage_levels),
+  type = "discrete"
+) |>
+  setNames(primary_tillage_levels)
+
+# FC passes colors
+fc_cols <- WB_brewer(
+  name = "LittleBlueHouseBesideTheSea1",
+  n    = length(fc_levels),
+  type = "discrete"
+) |>
+  setNames(fc_levels)
+
+# Rye rate colors
+rye_rate_cols <- WB_brewer(
+  name = "LittleBlueHouseBesideTheSea1",
+  n    = length(rye_rate_levels),
+  type = "discrete"
+) |>
+  setNames(rye_rate_levels)
+
+# If you ever want colors for the combined tilled treatment factor:
+fsb_trt_cols <- WB_brewer(
+  name = "LittleBlueHouseBesideTheSea1",
+  n    = length(fsb_trt_levels),
+  type = "discrete"
+) |>
+  setNames(fsb_trt_levels)
+
+# ------------------------------------------------------------------------
+# Label helpers
+# ------------------------------------------------------------------------
+
+label_break_spaces <- function(x) {
+  stringr::str_replace_all(x, " ", "\n")
+}
+
+label_break_comma <- function(x) {
+  stringr::str_replace_all(x, ", ", ",\n")
+}
+
+# For long combined labels like "Chisel plow, 2 FC, Low"
+label_break_comma_fc <- function(x) {
+  x |>
+    stringr::str_replace_all(", ", ",\n")
+}
+
+# ------------------------------------------------------------------------
+# Helper: tidy emmeans output regardless of CI column names
+# ------------------------------------------------------------------------
+# Works directly on an emmeans object
+
+tidy_emm <- function(emm, factor_col = NULL, ref_levels = NULL) {
+  emm_df <- as.data.frame(emm)
+
+  lcl_col <- intersect(c("lower.CL", "asymp.LCL"), names(emm_df))[1]
+  ucl_col <- intersect(c("upper.CL", "asymp.UCL"), names(emm_df))[1]
+
+  if (is.na(lcl_col) || is.na(ucl_col)) {
+    stop("Could not find CI columns in emmeans output.")
+  }
+
+  out <- emm_df |>
+    dplyr::mutate(
+      ci_low  = .data[[lcl_col]],
+      ci_high = .data[[ucl_col]]
+    )
+
+  if (!is.null(factor_col) && !is.null(ref_levels) &&
+      factor_col %in% names(out)) {
+
+    out <- out |>
+      dplyr::mutate(
+        !!factor_col := factor(.data[[factor_col]], levels = ref_levels)
+      )
+  }
+
+  out
+}
+
+```
+
+# Data import & prep
+```{r}
+# 1) Read + clean spring rye/weed biomass (False Seedbed) ----------------
+
+spring_rye_weed_biomass_clean <- read_excel(
+  here("Data", "raw", "spring_rye_weed_biomass_2025.xlsx")
+) |>
+  clean_names() |>
+  mutate(
+    # Block (derived from plot number like 101, 205, etc.)
+    block = factor(floor(plot / 100)),
+
+    # Primary tillage (main plot)
+    primary_tillage = recode(
+      tillage_type,
+      "chisel"         = "Chisel plow",
+      "chisel plow"    = "Chisel plow",
+      "moldboard"      = "Moldboard plow",
+      "moldboard plow" = "Moldboard plow",
+      "no-till"        = "No-till",
+      "no till"        = "No-till"
+    ),
+    primary_tillage = factor(primary_tillage,
+                             levels = primary_tillage_levels),
+
+    # Number of field cultivation passes (subplot)
+    # assuming 0–4 passes in a numeric column like number_cultivation_events
+    fc_passes = case_when(
+      number_cultivation_events == 1 ~ "1 FC",
+      number_cultivation_events == 2 ~ "2 FC",
+      number_cultivation_events == 3 ~ "3 FC",
+      number_cultivation_events == 4 ~ "4 FC",
+      TRUE                           ~ NA_character_  # e.g. no-till
+    ),
+    fc_passes = factor(fc_passes, levels = fc_levels),
+
+    # Rye seeding rate (sub-subplot)
+    rye_rate = case_when(
+      seeding_rate %in% c("low", "Low", "2M", "2 M")   ~ "Low",
+      seeding_rate %in% c("high", "High", "3M", "3 M") ~ "High",
+      TRUE ~ NA_character_
+    ),
+    rye_rate = factor(rye_rate, levels = rye_rate_levels),
+
+    # Combined treatment factors (tilled factorial only)
+    trt = factor(
+      paste(primary_tillage, fc_passes),
+      levels = fsb_trt_levels
+    ),
+    trt_rye = factor(
+      paste(primary_tillage, fc_passes, rye_rate),
+      levels = fsb_trt_rye_levels
+    )
+  ) |>
+  # Keep only rows with at least one non-missing biomass
+  filter(
+    !is.na(rye_biomass_g_0_5m2) |
+      !is.na(total_weed_biomass_g_0_5m2)
+  ) |>
+  # Per-area metrics, assuming biomass is g per 0.5 m² quadrat
+  mutate(
+    rye_biomass_g_m2         = rye_biomass_g_0_5m2        * 2,   # g/m²
+    rye_biomass_kg_ha        = rye_biomass_g_0_5m2        * 20,  # kg/ha
+    total_weed_biomass_g_m2  = total_weed_biomass_g_0_5m2 * 2,
+    total_weed_biomass_kg_ha = total_weed_biomass_g_0_5m2 * 20
+  )
+
+# Quick check ------------------------------------------------------------
+
+kable(
+  head(spring_rye_weed_biomass_clean),
+  caption = "NY False Seedbed, spring rye + weed biomass (cleaned)"
+)
+
+
+```
+# Rye biomass – treatment-effects model
+## Model testing
+### Exploratory
+```{r}
+# Subset to tilled factorial only (Chisel + Moldboard) -------------------
+fsb_rye_dat <- spring_rye_weed_biomass_clean |>
+  filter(
+    primary_tillage %in% c("Chisel plow", "Moldboard plow"),
+    !is.na(fc_passes),
+    !is.na(rye_rate)
+  ) |>
+  mutate(
+    trt_rye = factor(
+      paste(primary_tillage, fc_passes, rye_rate, sep = ", "),
+      levels = fsb_trt_rye_levels
+    )
+  )
+
+# 1) Summary table: rye biomass by primary tillage × FC × rye rate -------
+fsb_rye_dat |>
+  group_by(primary_tillage, fc_passes, rye_rate) |>
+  summarise(
+    n      = n(),
+    mean   = mean(rye_biomass_kg_ha, na.rm = TRUE),
+    median = median(rye_biomass_kg_ha, na.rm = TRUE),
+    sd     = sd(rye_biomass_kg_ha, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(primary_tillage, fc_passes, rye_rate) |>
+  kable(
+    digits  = 1,
+    caption = "Rye biomass (kg ha⁻¹) by primary tillage × FC passes × rye seeding rate"
+  ) |>
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+
+# 2) Boxplot: rye biomass by FC and seeding rate, faceted by tillage -----
+fsb_rye_dat |>
+  ggplot(aes(x = fc_passes,
+             y = rye_biomass_kg_ha,
+             fill = rye_rate)) +
+  geom_boxplot(
+    outlier.shape = NA,
+    width  = 0.6,
+    color  = "black"
+  ) +
+  geom_jitter(
+    width  = 0.15,
+    height = 0,
+    alpha  = 0.4,
+    size   = 1.8,
+    color  = "grey30"
+  ) +
+  facet_wrap(~ primary_tillage, nrow = 1) +
+  scale_fill_manual(values = rye_rate_cols, name = "Rye rate") +
+  scale_y_continuous(labels = scales::label_comma()) +
+  labs(
+    x     = "Field cultivation passes",
+    y     = expression(Rye~biomass~"(kg"~ha^{-1}*")"),
+    title = "Rye biomass by FC passes and seeding rate in tilled False Seedbed plots"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.x = element_text(size = 11),
+    strip.text  = element_text(face = "bold")
+  )
+
+```
+### Selection
+```{r}
+# Add IDs for nested experimental units ---------------------------------
+fsb_rye_dat <- fsb_rye_dat |>
+  mutate(
+    mainplot_id = interaction(block, primary_tillage, drop = TRUE),
+    subplot_id  = interaction(block, primary_tillage, fc_passes, drop = TRUE)
+  )
+
+# Full split–split model (3-way factorial) -------------------------------
+rye_mod_full <- lmer(
+  rye_biomass_kg_ha ~ primary_tillage * fc_passes * rye_rate +
+    (1 | block) +
+    (1 | block:primary_tillage) +
+    (1 | block:primary_tillage:fc_passes),
+  data = fsb_rye_dat
+)
+
+summary(rye_mod_full)
+anova(rye_mod_full, type = 3)
+
+# DHARMa residual diagnostics --------------------------------------------
+rye_sim <- DHARMa::simulateResiduals(rye_mod_full)
+plot(rye_sim)
+
+```
+
+### Figures
+#### Model estimated means
+```{r}
+# Emmeans for the full 3-way treatment structure ------------------------
+emm_rye_trt <- emmeans(
+  rye_mod_full,
+  ~ primary_tillage * fc_passes * rye_rate
+)
+
+emm_rye_trt_df <- tidy_emm(emm_rye_trt) |>
+  mutate(
+    trt_rye = factor(
+      paste(primary_tillage, fc_passes, rye_rate, sep = ", "),
+      levels = fsb_trt_rye_levels
+    )
+  )
+
+# Table of model-estimated means ----------------------------------------
+emm_rye_trt_df |>
+  arrange(trt_rye) |>
+  select(
+    trt_rye,
+    emmean,
+    ci_low,
+    ci_high
+  ) |>
+  kable(
+    digits = 1,
+    col.names = c("Treatment",
+                  "Rye biomass (kg ha⁻¹)",
+                  "Lower CI",
+                  "Upper CI"),
+    caption = "Model-estimated rye biomass by primary tillage × FC × rye rate"
+  ) |>
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+
+# Figure: treatment means with 95% CI -----------------------------------
+emm_rye_trt_df |>
+  ggplot(aes(x = trt_rye, y = emmean, fill = rye_rate)) +
+  geom_col(
+    position = position_dodge(width = 0.8),
+    width    = 0.75,
+    color    = "black"
+  ) +
+  geom_errorbar(
+    aes(ymin = ci_low, ymax = ci_high),
+    position = position_dodge(width = 0.8),
+    width    = 0.2
+  ) +
+  scale_fill_manual(values = rye_rate_cols, name = "Rye rate") +
+  scale_x_discrete(labels = label_break_comma_fc) +
+  scale_y_continuous(labels = scales::label_comma()) +
+  labs(
+    x     = NULL,
+    y     = expression(Rye~biomass~"(kg"~ha^{-1}*")"),
+    title = "Estimated rye biomass by primary tillage, FC passes, and seeding rate"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.x = element_text(size = 9),
+    strip.text  = element_text(face = "bold")
+  )
+
+
+```
+
+#### Raw means
+```{r}
+# Raw means + SE for the full 3-way treatment structure ------------------
+
+rye_raw_trt <- fsb_rye_dat |>
+  group_by(primary_tillage, fc_passes, rye_rate) |>
+  summarise(
+    n    = n(),
+    mean = mean(rye_biomass_kg_ha, na.rm = TRUE),
+    sd   = sd(rye_biomass_kg_ha, na.rm = TRUE),
+    se   = sd / sqrt(n),
+    .groups = "drop"
+  ) |>
+  mutate(
+    trt_rye = factor(
+      paste(primary_tillage, fc_passes, rye_rate, sep = ", "),
+      levels = fsb_trt_rye_levels
+    )
+  )
+
+# Table of raw means -----------------------------------------------------
+
+rye_raw_trt |>
+  arrange(trt_rye) |>
+  select(
+    trt_rye,
+    n,
+    mean,
+    se
+  ) |>
+  kable(
+    digits = 1,
+    col.names = c("Treatment",
+                  "n",
+                  "Rye biomass (kg ha⁻¹)",
+                  "SE"),
+    caption = "Raw rye biomass (kg ha⁻¹) by primary tillage × FC × rye rate (mean ± SE)"
+  ) |>
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+
+# Figure: raw means with SE ----------------------------------------------
+
+rye_raw_trt |>
+  ggplot(aes(x = trt_rye, y = mean, fill = rye_rate)) +
+  geom_col(
+    position = position_dodge(width = 0.8),
+    width    = 0.75,
+    color    = "black"
+  ) +
+  geom_errorbar(
+    aes(ymin = mean - se, ymax = mean + se),
+    position = position_dodge(width = 0.8),
+    width    = 0.2
+  ) +
+  scale_fill_manual(values = rye_rate_cols, name = "Rye rate") +
+  scale_x_discrete(labels = label_break_comma_fc) +
+  scale_y_continuous(labels = scales::label_comma()) +
+  labs(
+    x     = NULL,
+    y     = expression(Rye~biomass~"(kg"~ha^{-1}*")"),
+    title = "Raw rye biomass by primary tillage, FC passes, and seeding rate"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.x = element_text(size = 9)
+  )
+
+```
+
+# Spring weed biomass – treatment-effects model
+## Exploratory
+```{r}
+## Exploratory: spring weed biomass (kg ha⁻¹) ----------------------------
+
+# Subset to tilled factorial only (Chisel + Moldboard) -------------------
+fsb_weed_dat <- spring_rye_weed_biomass_clean |>
+  filter(
+    primary_tillage %in% c("Chisel plow", "Moldboard plow"),
+    !is.na(fc_passes),
+    !is.na(rye_rate)
+  ) |>
+  mutate(
+    trt_rye = factor(
+      paste(primary_tillage, fc_passes, rye_rate, sep = ", "),
+      levels = fsb_trt_rye_levels
+    )
+  )
+
+# 1) Summary table: weed biomass by primary tillage × FC × rye rate ------
+fsb_weed_dat |>
+  group_by(primary_tillage, fc_passes, rye_rate) |>
+  summarise(
+    n      = n(),
+    mean   = mean(total_weed_biomass_kg_ha, na.rm = TRUE),
+    median = median(total_weed_biomass_kg_ha, na.rm = TRUE),
+    sd     = sd(total_weed_biomass_kg_ha, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(primary_tillage, fc_passes, rye_rate) |>
+  kable(
+    digits  = 2,
+    caption = "Spring weed biomass (kg ha⁻¹) by primary tillage × FC passes × rye seeding rate"
+  ) |>
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+
+# 2) Boxplot: weed biomass by FC and seeding rate, faceted by tillage ----
+fsb_weed_dat |>
+  ggplot(aes(x = fc_passes,
+             y = total_weed_biomass_kg_ha,
+             fill = rye_rate)) +
+  geom_boxplot(
+    outlier.shape = NA,
+    width  = 0.6,
+    color  = "black"
+  ) +
+  geom_jitter(
+    width  = 0.15,
+    height = 0,
+    alpha  = 0.5,
+    size   = 1.8,
+    color  = "grey30"
+  ) +
+  facet_wrap(~ primary_tillage, nrow = 1) +
+  scale_fill_manual(values = rye_rate_cols, name = "Rye rate") +
+  scale_y_continuous(labels = scales::label_comma()) +
+  labs(
+    x     = "Field cultivation passes",
+    y     = expression(Weed~biomass~"(kg"~ha^{-1}*")"),
+    title = "Spring weed biomass by FC passes and seeding rate in tilled plots"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.x = element_text(size = 11),
+    strip.text  = element_text(face = "bold")
+  )
+
+```
+## Selection
+```{r}
+## Model testing / selection for spring weed biomass (kg ha⁻¹) ----------
+
+options(contrasts = c("contr.sum", "contr.poly"))
+
+# Base formula: full 3-way interaction + nested random effects
+form_weed_full <- total_weed_biomass_kg_ha ~
+  primary_tillage * fc_passes * rye_rate +
+  (1 | block) +
+  (1 | block:primary_tillage:fc_passes)
+
+## 1) Candidate families (all with interaction) -------------------------
+
+m_weed_tw <- glmmTMB(
+  formula = form_weed_full,
+  family  = tweedie(link = "log"),
+  data    = fsb_weed_dat
+)
+
+m_weed_nb <- glmmTMB(
+  formula = form_weed_full,
+  family  = nbinom2(link = "log"),
+  data    = fsb_weed_dat
+)
+
+m_weed_tw_zi <- glmmTMB(
+  formula   = form_weed_full,
+  family    = tweedie(link = "log"),
+  ziformula = ~ 1,
+  data      = fsb_weed_dat
+)
+
+# Safe AIC helper -------------------------------------------------------
+
+safe_aic <- function(mod) {
+  out <- try(AIC(mod), silent = TRUE)
+  if (inherits(out, "try-error")) return(NA_real_)
+  out
+}
+
+aic_weed_family <- tibble(
+  model = c(
+    "Weed: Tweedie",
+    "Weed: NB2",
+    "Weed: Tweedie + ZI"
+  ),
+  AIC = c(
+    safe_aic(m_weed_tw),
+    safe_aic(m_weed_nb),
+    safe_aic(m_weed_tw_zi)
+  )
+)
+
+kable(
+  aic_weed_family,
+  digits  = 1,
+  caption = "Spring weed biomass (kg ha⁻¹): candidate distributional families"
+) |>
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+
+## 2) Choose best family (NA-safe, >2 AIC units better) -----------------
+
+weed_best     <- m_weed_tw
+weed_best_nm  <- "Weed: Tweedie"
+weed_best_aic <- safe_aic(m_weed_tw)
+
+weed_cands <- list(
+  "Weed: NB2"          = m_weed_nb,
+  "Weed: Tweedie + ZI" = m_weed_tw_zi
+)
+
+for (nm in names(weed_cands)) {
+  this_aic <- safe_aic(weed_cands[[nm]])
+  if (is.finite(this_aic) && (this_aic + 2 < weed_best_aic)) {
+    weed_best     <- weed_cands[[nm]]
+    weed_best_nm  <- nm
+    weed_best_aic <- this_aic
+  }
+}
+
+cat("Selected family/structure for spring weed biomass:", weed_best_nm, "\n")
+
+## 3) Within chosen family: additive vs interaction ---------------------
+
+# Full interaction model in chosen family
+weed_int <- weed_best
+
+# Additive fixed-effects model in same family/random structure
+weed_add <- update(
+  weed_best,
+  formula = total_weed_biomass_kg_ha ~
+    primary_tillage + fc_passes + rye_rate +
+    (1 | block) +
+    (1 | block:primary_tillage:fc_passes)
+)
+
+# AIC comparison
+aic_weed_struct <- tibble(
+  model = c(
+    "Additive: primary_tillage + fc_passes + rye_rate",
+    "Interaction: primary_tillage * fc_passes * rye_rate"
+  ),
+  AIC = c(AIC(weed_add), AIC(weed_int))
+) |>
+  mutate(deltaAIC = AIC - min(AIC))
+
+kable(
+  aic_weed_struct,
+  digits  = 2,
+  caption = "Spring weed biomass (kg ha⁻¹): additive vs interaction (within chosen family)"
+) |>
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+
+# Likelihood-ratio test for interaction term (NA-safe) ------------------
+
+lrt_weed <- try(anova(weed_add, weed_int), silent = TRUE)
+
+if (inherits(lrt_weed, "try-error")) {
+  p_int_weed <- NA_real_
+} else {
+  p_int_weed <- lrt_weed$`Pr(>Chisq)`[2]
+}
+
+# Choose simpler model unless interaction clearly needed AND p-value is finite
+if (!is.na(p_int_weed) && p_int_weed < 0.05) {
+  weed_glmm            <- weed_int
+  chosen_model_name_weed <- "Interaction: primary_tillage * fc_passes * rye_rate"
+} else {
+  weed_glmm            <- weed_add
+  chosen_model_name_weed <- "Additive: primary_tillage + fc_passes + rye_rate"
+}
+
+cat(
+  "\nSelected model for spring weed biomass (used in downstream emmeans/plots):\n  ",
+  chosen_model_name_weed,
+  sprintf("  [LRT p = %s]\n", ifelse(is.na(p_int_weed), "NA", sprintf("%.3f", p_int_weed)))
+)
+
+## 4) Diagnostics + Type-III tests for the chosen model -----------------
+
+plot(residuals(weed_glmm) ~ fitted(weed_glmm))
+abline(h = 0, lty = 2)
+qqnorm(residuals(weed_glmm)); qqline(residuals(weed_glmm))
+
+car::Anova(weed_glmm, type = 3)
+
+```
+
+```{r}
+# Raw means + SE for weed biomass ---------------------------------------
+
+weed_raw_trt <- fsb_weed_dat |>
+  group_by(primary_tillage, fc_passes, rye_rate) |>
+  summarise(
+    n    = n(),
+    mean = mean(total_weed_biomass_kg_ha, na.rm = TRUE),
+    sd   = sd(total_weed_biomass_kg_ha, na.rm = TRUE),
+    se   = sd / sqrt(n),
+    .groups = "drop"
+  ) |>
+  mutate(
+    trt_rye = factor(
+      paste(primary_tillage, fc_passes, rye_rate, sep = ", "),
+      levels = fsb_trt_rye_levels
+    )
+  )
+
+# Table of raw means ----------------------------------------------------
+
+weed_raw_trt |>
+  arrange(trt_rye) |>
+  select(
+    trt_rye,
+    n,
+    mean,
+    se
+  ) |>
+  kable(
+    digits = 2,
+    col.names = c("Treatment",
+                  "n",
+                  "Weed biomass (kg ha⁻¹)",
+                  "SE"),
+    caption = "Raw spring weed biomass (kg ha⁻¹) by primary tillage × FC × rye rate (mean ± SE)"
+  ) |>
+  kable_styling(full_width = FALSE, bootstrap_options = c("striped", "hover"))
+
+# Figure: raw means with SE ---------------------------------------------
+
+weed_raw_trt |>
+  ggplot(aes(x = trt_rye, y = mean, fill = rye_rate)) +
+  geom_col(
+    position = position_dodge(width = 0.8),
+    width    = 0.75,
+    color    = "black"
+  ) +
+  geom_errorbar(
+    aes(ymin = mean - se, ymax = mean + se),
+    position = position_dodge(width = 0.8),
+    width    = 0.2
+  ) +
+  scale_fill_manual(values = rye_rate_cols, name = "Rye rate") +
+  scale_x_discrete(labels = label_break_comma_fc) +
+  scale_y_continuous(labels = scales::label_comma()) +
+  labs(
+    x     = NULL,
+    y     = expression(Weed~biomass~"(kg"~ha^{-1}*")"),
+    title = "Raw spring weed biomass by primary tillage, FC passes, and seeding rate"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.x = element_text(size = 9)
+  )
+
+```
+```{r}
+weed_raw_trt |>
+  ggplot(aes(x = fc_passes, y = mean, fill = rye_rate)) +
+  geom_col(
+    position = position_dodge(width = 0.8),
+    width    = 0.7,
+    colour   = "black"
+  ) +
+  geom_errorbar(
+    aes(ymin = mean - se, ymax = mean + se),
+    position = position_dodge(width = 0.8),
+    width    = 0.2
+  ) +
+  facet_wrap(~ primary_tillage, nrow = 1) +
+  scale_fill_manual(values = rye_rate_cols, name = "Rye rate") +
+  scale_y_continuous(labels = scales::label_comma(), limits = c(0, NA)) +
+  labs(
+    x = "Field cultivation passes",
+    y = expression(Weed~biomass~"(kg"~ha^{-1}*")"),
+    title = "Raw spring weed biomass by FC passes and seeding rate"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(axis.text.x = element_text(size = 11),
+        strip.text  = element_text(face = "bold"))
+
+```
+#Rye–weed relationship – exploratory
+```{r}
+## Rye–weed relationship at spring sampling ------------------------------
+
+fsb_pair <- spring_rye_weed_biomass_clean |>
+  filter(
+    primary_tillage %in% c("Chisel plow", "Moldboard plow"),
+    !is.na(fc_passes),
+    !is.na(rye_rate)
+  )
+
+# 1) Simple correlation (overall) ----------------------------------------
+with(fsb_pair, cor(rye_biomass_kg_ha, total_weed_biomass_kg_ha))
+
+# 2) Scatterplot with lm smooth ------------------------------------------
+fsb_pair |>
+  ggplot(aes(x = rye_biomass_kg_ha,
+             y = total_weed_biomass_kg_ha,
+             colour = rye_rate,
+             shape  = primary_tillage)) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  geom_point(size = 2, alpha = 0.8) +
+  geom_smooth(method = "lm", se = FALSE) +
+  scale_color_manual(values = rye_rate_cols, name = "Rye rate") +
+  scale_y_continuous(labels = scales::label_comma()) +
+  labs(
+    x = expression(Rye~biomass~"(kg"~ha^{-1}*")"),
+    y = expression(Spring~weed~biomass~"(kg"~ha^{-1}*")"),
+    title = "Relationship between rye biomass and spring weed biomass"
+  ) +
+  theme_classic(base_size = 14)
+
+
+```
+```{r}
+weed_rye_mod <- glmmTMB(
+  total_weed_biomass_kg_ha ~ scale(rye_biomass_kg_ha) +
+    primary_tillage + fc_passes + rye_rate +
+    (1 | block) + (1 | block:primary_tillage:fc_passes),
+  family    = tweedie(link = "log"),
+  ziformula = ~ 1,
+  data      = fsb_pair
+)
+
+summary(weed_rye_mod)
+car::Anova(weed_rye_mod, type = 3)  # test rye effect
+
+```
+
