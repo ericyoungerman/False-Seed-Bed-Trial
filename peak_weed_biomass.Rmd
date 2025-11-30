@@ -1,0 +1,1029 @@
+---
+title: "Peak weed biomass"
+
+output:
+  github_document:
+    toc: true
+always_allow_html: true
+---
+#Setup
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.path = "figs/analysis/peak_weed_biomass-"
+)
+```
+# Packages
+```{r}
+# 1) Packages and conflicts ---------------------------------------------
+
+library(tidyverse)    # dplyr, ggplot2, readr, tibble, etc.
+library(janitor)
+library(readxl)
+library(glmmTMB)
+library(DHARMa)
+library(emmeans)
+library(multcomp)
+library(car)
+library(kableExtra)
+library(here)
+library(conflicted)
+library(lme4)
+library(WrensBookshelf)
+
+# Handle conflicts
+conflicts_prefer(dplyr::select)
+conflicts_prefer(dplyr::filter)
+conflicts_prefer(dplyr::recode)
+
+# 2) Treatment level order (use everywhere) -----------------------------
+
+# Main plot: primary tillage
+primary_tillage_levels <- c(
+  "Chisel plow",
+  "Moldboard plow",
+  "No-till"
+)
+
+# Subplot: number of field cultivation passes
+fc_levels <- c("1 FC", "2 FC", "3 FC", "4 FC")
+
+# Sub-subplot: rye seeding rate
+rye_rate_levels <- c("Low", "High")
+
+# Combined treatment levels for tilled factorial (primary tillage × FC)
+fsb_trt_levels <- c(
+  "Chisel plow, 1 FC",
+  "Chisel plow, 2 FC",
+  "Chisel plow, 3 FC",
+  "Chisel plow, 4 FC",
+  "Moldboard plow, 1 FC",
+  "Moldboard plow, 2 FC",
+  "Moldboard plow, 3 FC",
+  "Moldboard plow, 4 FC"
+)
+
+# Combined treatment levels for full 3-way (primary × FC × rye rate)
+fsb_trt_rye_levels <- c(
+  "Chisel plow, 1 FC, Low",
+  "Chisel plow, 1 FC, High",
+  "Chisel plow, 2 FC, Low",
+  "Chisel plow, 2 FC, High",
+  "Chisel plow, 3 FC, Low",
+  "Chisel plow, 3 FC, High",
+  "Chisel plow, 4 FC, Low",
+  "Chisel plow, 4 FC, High",
+  "Moldboard plow, 1 FC, Low",
+  "Moldboard plow, 1 FC, High",
+  "Moldboard plow, 2 FC, Low",
+  "Moldboard plow, 2 FC, High",
+  "Moldboard plow, 3 FC, Low",
+  "Moldboard plow, 3 FC, High",
+  "Moldboard plow, 4 FC, Low",
+  "Moldboard plow, 4 FC, High"
+)
+
+# 3) Color palettes (WrensBookshelf: LittleBlueHouseBesideTheSea1) ------
+
+# Primary tillage colors
+primary_tillage_cols <- WB_brewer(
+  name = "LittleBlueHouseBesideTheSea1",
+  n    = length(primary_tillage_levels),
+  type = "discrete"
+) |>
+  setNames(primary_tillage_levels)
+
+# FC passes colors
+fc_cols <- WB_brewer(
+  name = "LittleBlueHouseBesideTheSea1",
+  n    = length(fc_levels),
+  type = "discrete"
+) |>
+  setNames(fc_levels)
+
+# Rye rate colors
+rye_rate_cols <- WB_brewer(
+  name = "LittleBlueHouseBesideTheSea1",
+  n    = length(rye_rate_levels),
+  type = "discrete"
+) |>
+  setNames(rye_rate_levels)
+
+# If you ever want colors for the combined tilled treatment factor:
+fsb_trt_cols <- WB_brewer(
+  name = "LittleBlueHouseBesideTheSea1",
+  n    = length(fsb_trt_levels),
+  type = "discrete"
+) |>
+  setNames(fsb_trt_levels)
+
+# 4) Label helpers -------------------------------------------------------
+
+label_break_spaces <- function(x) {
+  stringr::str_replace_all(x, " ", "\n")
+}
+
+label_break_comma <- function(x) {
+  stringr::str_replace_all(x, ", ", ",\n")
+}
+
+# For long combined labels like "Chisel plow, 2 FC, Low"
+label_break_comma_fc <- function(x) {
+  x |>
+    stringr::str_replace_all(", ", ",\n")
+}
+
+# 5) Helper: tidy emmeans output regardless of CI column names ----------
+
+tidy_emm <- function(emm, factor_col = NULL, ref_levels = NULL) {
+  emm_df <- as.data.frame(emm)
+
+  lcl_col <- intersect(c("lower.CL", "asymp.LCL"), names(emm_df))[1]
+  ucl_col <- intersect(c("upper.CL", "asymp.UCL"), names(emm_df))[1]
+
+  if (is.na(lcl_col) || is.na(ucl_col)) {
+    stop("Could not find CI columns in emmeans output.")
+  }
+
+  out <- emm_df |>
+    dplyr::mutate(
+      ci_low  = .data[[lcl_col]],
+      ci_high = .data[[ucl_col]]
+    )
+
+  if (!is.null(factor_col) && !is.null(ref_levels) &&
+      factor_col %in% names(out)) {
+
+    out <- out |>
+      dplyr::mutate(
+        !!factor_col := factor(.data[[factor_col]], levels = ref_levels)
+      )
+  }
+
+  out
+}
+
+```
+# Data import
+## Rye biomass
+```{r}
+## 2) Rye biomass (termination sampling) ---------------------------------
+
+rye_biomass_clean <- read_excel(
+  here("Data", "raw", "spring_rye_weed_biomass_2025.xlsx")
+) |>
+  clean_names() |>
+  mutate(
+    # 2.1) Basic factors --------------------------------------------------
+    block = factor(floor(plot / 100)),
+    primary_tillage = recode(
+      tillage_type,
+      "chisel"         = "Chisel plow",
+      "chisel plow"    = "Chisel plow",
+      "moldboard"      = "Moldboard plow",
+      "moldboard plow" = "Moldboard plow",
+      "no-till"        = "No-till",
+      "no till"        = "No-till",
+      "no-tillage"     = "No-till"
+    ),
+    primary_tillage = factor(primary_tillage, levels = primary_tillage_levels),
+
+    fc_passes = case_when(
+      number_cultivation_events == 1 ~ "1 FC",
+      number_cultivation_events == 2 ~ "2 FC",
+      number_cultivation_events == 3 ~ "3 FC",
+      number_cultivation_events == 4 ~ "4 FC",
+      TRUE                           ~ NA_character_
+    ),
+    fc_passes = factor(fc_passes, levels = fc_levels),
+
+    rye_rate = case_when(
+      seeding_rate %in% c("low", "Low", "2M", "2 M")   ~ "Low",
+      seeding_rate %in% c("high", "High", "3M", "3 M") ~ "High",
+      TRUE ~ NA_character_
+    ),
+    rye_rate = factor(rye_rate, levels = rye_rate_levels)
+  ) |>
+  # 2.2) Keep tilled factorial only (Chisel + Moldboard) ----------------
+  filter(
+    primary_tillage %in% c("Chisel plow", "Moldboard plow"),
+    !is.na(fc_passes),
+    !is.na(rye_rate),
+    !is.na(rye_biomass_g_0_5m2)
+  ) |>
+  # 2.3) Area conversion + keep key columns ------------------------------
+  mutate(
+    rye_biomass_kg_ha = rye_biomass_g_0_5m2 * 20
+  ) |>
+  select(
+    plot,
+    block,
+    primary_tillage,
+    fc_passes,
+    rye_rate,
+    rye_biomass_kg_ha
+  )
+
+# Quick check table -----------------------------------------------------
+
+kable(
+  head(rye_biomass_clean),
+  digits  = 1,
+  caption = "Rye biomass (kg ha⁻¹) at termination, by plot (tilled factorial only)"
+) |>
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped", "hover")
+  )
+
+```
+
+## Peak weed biomass with rye biomass joined
+```{r}
+## 3) Peak weed biomass with rye biomass joined --------------------------
+
+# 3.1) Peak weed biomass data (September sampling) ----------------------
+
+peak_weed_biomass_clean <- read_excel(
+  here("Data", "raw", "peak_weed_biomass_2025.xlsx")
+) |>
+  clean_names() |>
+  mutate(
+    block = factor(floor(plot / 100)),
+    primary_tillage = recode(
+      tillage_type,
+      "chisel"         = "Chisel plow",
+      "chisel plow"    = "Chisel plow",
+      "moldboard"      = "Moldboard plow",
+      "moldboard plow" = "Moldboard plow",
+      "no-till"        = "No-till",
+      "no till"        = "No-till",
+      "no-tillage"     = "No-till"
+    ),
+    primary_tillage = factor(primary_tillage, levels = primary_tillage_levels),
+
+    fc_passes = case_when(
+      number_cultivation_events == 1 ~ "1 FC",
+      number_cultivation_events == 2 ~ "2 FC",
+      number_cultivation_events == 3 ~ "3 FC",
+      number_cultivation_events == 4 ~ "4 FC",
+      TRUE                           ~ NA_character_
+    ),
+    fc_passes = factor(fc_passes, levels = fc_levels),
+
+    rye_rate = case_when(
+      seeding_rate %in% c("low", "Low", "2M", "2 M")   ~ "Low",
+      seeding_rate %in% c("high", "High", "3M", "3 M") ~ "High",
+      TRUE ~ NA_character_
+    ),
+    rye_rate = factor(rye_rate, levels = rye_rate_levels)
+  ) |>
+  # Tilled factorial only for this analysis (Chisel + Moldboard) --------
+  filter(
+    primary_tillage %in% c("Chisel plow", "Moldboard plow"),
+    !is.na(fc_passes),
+    !is.na(rye_rate),
+    !is.na(weed_biomass)
+  ) |>
+  mutate(
+    # Assuming weed_biomass is g per 0.5 m² quadrat
+    peak_weed_biomass_kg_ha = weed_biomass * 20
+  )
+
+# 3.2) Join rye biomass into the peak weed dataset ----------------------
+
+fsb_peak <- peak_weed_biomass_clean |>
+  left_join(
+    rye_biomass_clean |>
+      select(plot, rye_biomass_kg_ha),
+    by = "plot"
+  ) |>
+  # IDs for mixed model structure (used in PW1 / PW2)
+  mutate(
+    mainplot_id = interaction(block, primary_tillage, drop = TRUE),
+    subplot_id  = interaction(block, primary_tillage, fc_passes, drop = TRUE)
+  )
+
+# Quick check table: joined rye + peak weed -----------------------------
+
+fsb_peak |>
+  select(
+    plot,
+    block,
+    primary_tillage,
+    fc_passes,
+    rye_rate,
+    rye_biomass_kg_ha,
+    peak_weed_biomass_kg_ha
+  ) |>
+  head() |>
+  kable(
+    digits  = 1,
+    caption = "Check: rye biomass + peak weed biomass (kg ha⁻¹) by plot (tilled factorial only)"
+  ) |>
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped", "hover")
+  )
+
+
+```
+# Model PW1: treatment effects only
+```{r}
+## 4) Model PW1 – Treatment effects on peak weed biomass -----------------
+
+# 4.1) Analysis dataset check (tilled factorial only) --------------------
+# fsb_peak was created in Section 3 and already:
+#  - filters to Chisel + Moldboard
+#  - keeps non-missing fc_passes, rye_rate, peak_weed_biomass_kg_ha
+#  - joins rye_biomass_kg_ha
+#  - adds mainplot_id / subplot_id
+
+kable(
+  fsb_peak |>
+    count(primary_tillage, fc_passes, rye_rate),
+  caption = "Peak weed biomass: sample size by primary tillage × FC passes × rye rate (tilled factorial)"
+) |>
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped", "hover")
+  )
+
+# 4.2) Contrasts for Type III tests -------------------------------------
+
+options(contrasts = c("contr.sum", "contr.poly"))
+
+# Full interaction fixed + random structure
+form_pw1 <- peak_weed_biomass_kg_ha ~
+  primary_tillage * fc_passes * rye_rate +
+  (1 | block) +
+  (1 | block:primary_tillage:fc_passes)
+
+## 4.3) Candidate families (all with full interaction) ------------------
+
+m_pw1_tw <- glmmTMB(
+  formula = form_pw1,
+  family  = tweedie(link = "log"),
+  data    = fsb_peak
+)
+
+m_pw1_nb <- glmmTMB(
+  formula = form_pw1,
+  family  = nbinom2(link = "log"),
+  data    = fsb_peak
+)
+
+m_pw1_tw_zi <- glmmTMB(
+  formula   = form_pw1,
+  family    = tweedie(link = "log"),
+  ziformula = ~ 1,
+  data      = fsb_peak
+)
+
+# Safe AIC helper --------------------------------------------------------
+
+safe_aic <- function(mod) {
+  out <- try(AIC(mod), silent = TRUE)
+  if (inherits(out, "try-error")) return(NA_real_)
+  out
+}
+
+aic_pw1_family <- tibble(
+  model = c(
+    "PW1: Tweedie",
+    "PW1: NB2",
+    "PW1: Tweedie + ZI"
+  ),
+  AIC = c(
+    safe_aic(m_pw1_tw),
+    safe_aic(m_pw1_nb),
+    safe_aic(m_pw1_tw_zi)
+  )
+)
+
+kable(
+  aic_pw1_family,
+  digits  = 1,
+  caption = "Peak weed biomass (kg ha⁻¹): candidate distributional families (Model PW1)"
+) |>
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped", "hover")
+  )
+
+## 4.4) Choose best family (NA-safe, > 2 AIC units better) --------------
+
+pw1_best     <- m_pw1_tw
+pw1_best_nm  <- "PW1: Tweedie"
+pw1_best_aic <- safe_aic(m_pw1_tw)
+
+pw1_cands <- list(
+  "PW1: NB2"          = m_pw1_nb,
+  "PW1: Tweedie + ZI" = m_pw1_tw_zi
+)
+
+for (nm in names(pw1_cands)) {
+  this_aic <- safe_aic(pw1_cands[[nm]])
+  if (is.finite(this_aic) && (this_aic + 2 < pw1_best_aic)) {
+    pw1_best     <- pw1_cands[[nm]]
+    pw1_best_nm  <- nm
+    pw1_best_aic <- this_aic
+  }
+}
+
+cat("Selected family/structure for peak weed biomass (PW1):", pw1_best_nm, "\n")
+
+## 4.5) Within chosen family: additive vs interaction --------------------
+
+# Full interaction model in chosen family
+peak_int_pw1 <- pw1_best
+
+# Additive fixed-effects model in same family and random structure
+peak_add_pw1 <- update(
+  pw1_best,
+  formula = peak_weed_biomass_kg_ha ~
+    primary_tillage + fc_passes + rye_rate +
+    (1 | block) +
+    (1 | block:primary_tillage:fc_passes)
+)
+
+# AIC comparison for structure
+aic_pw1_struct <- tibble(
+  model = c(
+    "PW1 additive: primary_tillage + fc_passes + rye_rate",
+    "PW1 interaction: primary_tillage * fc_passes * rye_rate"
+  ),
+  AIC = c(AIC(peak_add_pw1), AIC(peak_int_pw1))
+) |>
+  mutate(deltaAIC = AIC - min(AIC))
+
+kable(
+  aic_pw1_struct,
+  digits  = 2,
+  caption = "Peak weed biomass (kg ha⁻¹): additive vs interaction (within chosen family)"
+) |>
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped", "hover")
+  )
+
+# Likelihood-ratio test for interaction (NA-safe) ------------------------
+
+lrt_pw1 <- try(anova(peak_add_pw1, peak_int_pw1), silent = TRUE)
+
+if (inherits(lrt_pw1, "try-error")) {
+  p_int_pw1 <- NA_real_
+} else {
+  p_int_pw1 <- lrt_pw1$`Pr(>Chisq)`[2]
+}
+
+# Choose simpler model unless interaction is clearly needed
+if (!is.na(p_int_pw1) && p_int_pw1 < 0.05) {
+  peak_glmm_pw1         <- peak_int_pw1
+  chosen_model_name_pw1 <- "Interaction: primary_tillage * fc_passes * rye_rate"
+} else {
+  peak_glmm_pw1         <- peak_add_pw1
+  chosen_model_name_pw1 <- "Additive: primary_tillage + fc_passes + rye_rate"
+}
+
+cat(
+  "\nSelected model for peak weed biomass (PW1, used in downstream emmeans/plots):\n  ",
+  chosen_model_name_pw1,
+  sprintf(
+    "  [LRT p = %s]\n",
+    ifelse(is.na(p_int_pw1), "NA", sprintf('%.3f', p_int_pw1))
+  )
+)
+
+## 4.6) Diagnostics + Type-III tests for the chosen model ----------------
+
+set.seed(123)
+res_pw1 <- DHARMa::simulateResiduals(peak_glmm_pw1)
+plot(res_pw1)
+DHARMa::testDispersion(peak_glmm_pw1)
+DHARMa::testZeroInflation(peak_glmm_pw1)
+
+car::Anova(peak_glmm_pw1, type = 3)
+
+```
+
+## Figure
+```{r}
+## 5) Figure – Raw peak weed biomass (Model PW1) -------------------------
+
+# 5.1) Raw means + SE by treatment --------------------------------------
+
+peak_raw_trt <- fsb_peak |>
+  group_by(primary_tillage, fc_passes, rye_rate) |>
+  summarise(
+    n    = n(),
+    mean = mean(peak_weed_biomass_kg_ha, na.rm = TRUE),
+    sd   = sd(peak_weed_biomass_kg_ha, na.rm = TRUE),
+    se   = sd / sqrt(n),
+    .groups = "drop"
+  )
+
+# Table of raw means -----------------------------------------------------
+
+peak_raw_trt |>
+  arrange(primary_tillage, fc_passes, rye_rate) |>
+  kable(
+    digits  = 1,
+    col.names = c("Primary tillage",
+                  "FC passes",
+                  "Rye rate",
+                  "n",
+                  "Peak weed biomass (kg ha⁻¹)",
+                  "SD",
+                  "SE"),
+    caption = "Raw peak weed biomass (kg ha⁻¹) by primary tillage × FC passes × rye seeding rate (mean ± SE)"
+  ) |>
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped", "hover")
+  )
+
+# 5.2) Figure: raw means with SE, faceted by tillage --------------------
+
+p_pw1_raw <- peak_raw_trt |>
+  ggplot(aes(x = fc_passes, y = mean, fill = rye_rate)) +
+  geom_col(
+    position = position_dodge(width = 0.8),
+    width    = 0.7,
+    colour   = "black"
+  ) +
+  geom_errorbar(
+    aes(ymin = mean - se, ymax = mean + se),
+    position = position_dodge(width = 0.8),
+    width    = 0.2
+  ) +
+  facet_wrap(~ primary_tillage, nrow = 1) +
+  scale_fill_manual(values = rye_rate_cols, name = "Rye rate") +
+  scale_y_continuous(labels = scales::label_comma(), limits = c(0, NA)) +
+  labs(
+    x       = "Field cultivation passes",
+    y       = expression(Peak~weed~biomass~"(kg"~ha^{-1}*")"),
+    title   = "Peak weed biomass by FC passes and rye seeding rate (tilled plots)",
+    caption = "Bars show raw means (kg"~ha^{-1}*") ± SE."
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.text.x   = element_text(size = 11),
+    strip.text    = element_text(face = "bold"),
+    plot.title    = element_text(hjust = 0.5),
+    plot.caption  = element_text(hjust = 0.5, size = 10, margin = margin(t = 4))
+  )
+
+p_pw1_raw
+
+# 5.3) Save figure -------------------------------------------------------
+
+ggsave(
+  filename = here("figs", "analysis", "peak_weed_PW1_raw.png"),
+  plot     = p_pw1_raw,
+  width    = 8,
+  height   = 5,
+  dpi      = 300
+)
+
+```
+# Model PW2 – Peak weeds vs rye biomass (covariate model)
+```{r}
+## 6) Model PW2 – Peak weeds vs rye biomass (covariate model) -----------
+
+# 6.1) Analysis dataset: complete cases for rye + peak weeds ------------
+
+fsb_peak_cov <- fsb_peak |>
+  filter(
+    !is.na(rye_biomass_kg_ha),
+    !is.na(peak_weed_biomass_kg_ha)
+  )
+
+## 6.2) Figure – Rye vs peak weeds scatterplot --------------------------
+
+p_pw2_scatter <- fsb_peak_cov |>
+  ggplot(aes(
+    x      = rye_biomass_kg_ha,
+    y      = peak_weed_biomass_kg_ha,
+    colour = rye_rate,          # Low vs High
+    shape  = primary_tillage    # Chisel vs Moldboard (points)
+  )) +
+  geom_point(size = 2, alpha = 0.8) +
+  geom_smooth(
+    aes(linetype = primary_tillage),
+    method      = "lm",
+    se          = FALSE,
+    show.legend = FALSE
+  ) +
+  scale_color_manual(values = rye_rate_cols, name = "Rye rate") +
+  scale_shape_discrete(name = "Primary tillage") +
+  scale_y_continuous(labels = scales::label_comma()) +
+  scale_x_continuous(labels = scales::label_comma()) +
+  labs(
+    x       = expression(Rye~biomass~"(kg"~ha^{-1}*")"),
+    y       = expression(Peak~weed~biomass~"(kg"~ha^{-1}*")"),
+    title   = "Relationship between rye biomass and peak weed biomass",
+    caption = "Lines show separate linear fits by primary tillage and rye seeding rate."
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title   = element_text(hjust = 0.5),
+    plot.caption = element_text(hjust = 0.5, size = 10, margin = margin(t = 4))
+  )
+
+p_pw2_scatter
+
+ggsave(
+  filename = here("figs", "analysis", "peak_weed_PW2_scatter.png"),
+  plot     = p_pw2_scatter,
+  width    = 8,
+  height   = 5,
+  dpi      = 300
+)
+
+# 6.3) Models: with and without rye covariate ---------------------------
+
+# PW2a: baseline (no rye covariate)
+# (Same structure as PW1 additive, re-fit here for clean comparison)
+
+pw2_base <- glmmTMB(
+  peak_weed_biomass_kg_ha ~
+    primary_tillage + fc_passes + rye_rate +
+    (1 | block) +
+    (1 | block:primary_tillage:fc_passes),
+  family  = tweedie(link = "log"),
+  data    = fsb_peak_cov
+)
+
+# PW2b: add rye biomass as covariate
+pw2_rye <- glmmTMB(
+  peak_weed_biomass_kg_ha ~
+    scale(rye_biomass_kg_ha) +
+    primary_tillage + fc_passes + rye_rate +
+    (1 | block) +
+    (1 | block:primary_tillage:fc_passes),
+  family  = tweedie(link = "log"),
+  data    = fsb_peak_cov
+)
+
+# 6.4) AIC comparison: does adding rye improve fit? ---------------------
+
+aic_pw2 <- tibble(
+  model = c(
+    "PW2 base: no rye covariate",
+    "PW2 rye: + scaled rye biomass"
+  ),
+  AIC = c(AIC(pw2_base), AIC(pw2_rye))
+) |>
+  mutate(deltaAIC = AIC - min(AIC))
+
+kable(
+  aic_pw2,
+  digits  = 2,
+  caption = "Peak weed biomass (kg ha⁻¹): effect of adding rye biomass as covariate (Model PW2)"
+) |>
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped", "hover")
+  )
+
+# 6.5) Likelihood-ratio test: rye term ----------------------------------
+
+lrt_pw2 <- try(anova(pw2_base, pw2_rye), silent = TRUE)
+lrt_pw2
+
+# 6.6) Type III tests for PW2 rye model (focus on rye term) -------------
+
+car::Anova(pw2_rye, type = 3)
+
+# Tidy summary of the rye covariate effect
+rye_cov_summary <- summary(pw2_rye)$coefficients$cond["scale(rye_biomass_kg_ha)", ]
+rye_cov_summary
+
+```
+
+
+```{r}
+## 7) Peak weed biomass for system-level comparison (incl. no-till) -----
+
+peak_weed_biomass_all <- read_excel(
+  here("Data", "raw", "peak_weed_biomass_2025.xlsx")
+) |>
+  clean_names() |>
+  mutate(
+    block = factor(floor(plot / 100)),
+    primary_tillage = recode(
+      tillage_type,
+      "chisel"         = "Chisel plow",
+      "chisel plow"    = "Chisel plow",
+      "moldboard"      = "Moldboard plow",
+      "moldboard plow" = "Moldboard plow",
+      "no-till"        = "No-till",
+      "no till"        = "No-till",
+      "no-tillage"     = "No-till"   # just in case this spelling appears
+    ),
+    primary_tillage = factor(primary_tillage, levels = primary_tillage_levels),
+
+    fc_passes = case_when(
+      number_cultivation_events == 1 ~ "1 FC",
+      number_cultivation_events == 2 ~ "2 FC",
+      number_cultivation_events == 3 ~ "3 FC",
+      number_cultivation_events == 4 ~ "4 FC",
+      TRUE                           ~ NA_character_  # covers no-till
+    ),
+    fc_passes = factor(fc_passes, levels = fc_levels),
+
+    rye_rate = case_when(
+      seeding_rate %in% c("low", "Low", "2M", "2 M")   ~ "Low",
+      seeding_rate %in% c("high", "High", "3M", "3 M") ~ "High",
+      TRUE ~ NA_character_
+    ),
+    rye_rate = factor(rye_rate, levels = rye_rate_levels),
+
+    peak_weed_biomass_kg_ha = weed_biomass * 20
+  ) |>
+  filter(
+    !is.na(primary_tillage),
+    !is.na(rye_rate),
+    !is.na(peak_weed_biomass_kg_ha)
+  )
+
+# 7.1) Quick peek at the data -------------------------------------------
+
+kable(
+  head(peak_weed_biomass_all),
+  digits  = 1,
+  caption = "Peak weed biomass (kg ha⁻¹) including no-till plots"
+) |>
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped", "hover")
+  )
+
+# Optional: check counts by system to confirm no-till sample size
+peak_weed_biomass_all |>
+  count(primary_tillage, rye_rate) |>
+  kable(
+    digits  = 0,
+    col.names = c("Primary tillage", "Rye rate", "n"),
+    caption = "Sample size by primary tillage × rye seeding rate (including no-till)"
+  ) |>
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped", "hover")
+  )
+
+
+```
+# Model PW3 – System-level comparison including no-till
+```{r}
+## 7) Model PW3 – System-level comparison including no-till -------------
+
+# 7.1) Define system-level treatment factor -----------------------------
+
+system_trt_levels <- c(
+  paste("No-till", rye_rate_levels, sep = ", "),
+  fsb_trt_rye_levels
+)
+
+fsb_peak_all <- peak_weed_biomass_all |>
+  mutate(
+    # Give no-till an explicit "0 FC" label so it fits the same pattern
+    fc_passes_sys = case_when(
+      primary_tillage == "No-till" ~ "0 FC",
+      TRUE                         ~ as.character(fc_passes)
+    ),
+    fc_passes_sys = factor(fc_passes_sys, levels = c("0 FC", fc_levels)),
+
+    # System-level treatment: primary tillage × FC (incl. 0 FC) × rye rate
+    system_trt = if_else(
+      primary_tillage == "No-till",
+      paste("No-till", rye_rate, sep = ", "),
+      paste(primary_tillage, fc_passes_sys, rye_rate, sep = ", ")
+    ),
+    system_trt = factor(system_trt, levels = system_trt_levels)
+  )
+
+# Check that all treatments (including no-till) are present -------------
+fsb_peak_all |>
+  count(system_trt, .drop = FALSE) |>
+  kable(
+    digits    = 0,
+    col.names = c("System treatment", "n"),
+    caption   = "Sample size by system-level treatment (including no-till)"
+  ) |>
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped", "hover")
+  )
+
+# 7.2) GLMM for system-level treatments --------------------------------
+
+pw3_mod <- glmmTMB(
+  peak_weed_biomass_kg_ha ~ system_trt + (1 | block),
+  family  = tweedie(link = "log"),
+  data    = fsb_peak_all
+)
+
+car::Anova(pw3_mod, type = 3)
+
+# 7.3) Emmeans and table of system-level means --------------------------
+
+emm_pw3 <- emmeans(pw3_mod, ~ system_trt, type = "response")
+
+emm_pw3_df <- tidy_emm(
+  emm_pw3,
+  factor_col = "system_trt",
+  ref_levels = system_trt_levels
+)
+
+emm_pw3_df |>
+  select(system_trt, response, ci_low, ci_high) |>
+  kable(
+    digits    = 1,
+    col.names = c("System treatment",
+                  "Peak weed biomass (kg ha⁻¹)",
+                  "Lower CI",
+                  "Upper CI"),
+    caption   = "Peak weed biomass by system-level treatment (including no-till; model-estimated means ± 95% CI)"
+  ) |>
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped", "hover")
+  )
+
+# 7.4) Figure: raw system-level means ± SE (including no-till) -----------
+
+pw3_raw_trt <- fsb_peak_all |>
+  group_by(primary_tillage, system_trt) |>
+  summarise(
+    n    = n(),
+    mean = mean(peak_weed_biomass_kg_ha, na.rm = TRUE),
+    sd   = sd(peak_weed_biomass_kg_ha, na.rm = TRUE),
+    se   = sd / sqrt(n),
+    .groups = "drop"
+  ) |>
+  mutate(
+    system_trt = factor(system_trt, levels = system_trt_levels)
+  )
+
+pw3_raw_trt |>
+  arrange(system_trt) |>
+  kable(
+    digits = 1,
+    col.names = c("Primary tillage",
+                  "System treatment",
+                  "n",
+                  "Peak weed biomass (kg ha⁻¹)",
+                  "SD",
+                  "SE"),
+    caption = "Raw peak weed biomass (kg ha⁻¹) by system-level treatment (including no-till; mean ± SE)"
+  ) |>
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped", "hover")
+  )
+
+p_pw3_sys_raw <- pw3_raw_trt |>
+  ggplot(aes(x = system_trt, y = mean, fill = primary_tillage)) +
+  geom_col(colour = "black", width = 0.7) +
+  geom_errorbar(
+    aes(ymin = mean - se, ymax = mean + se),
+    width = 0.2
+  ) +
+  scale_fill_manual(values = primary_tillage_cols, name = "Primary tillage") +
+  scale_y_continuous(labels = scales::label_comma(), limits = c(0, NA)) +
+  labs(
+    x       = NULL,
+    y       = expression(Peak~weed~biomass~"(kg"~ha^{-1}*")"),
+    title   = "Weed biomass by system-level treatment",
+    caption = "Bars show raw means (kg ha\u207b\u00b9) ± SE; colours indicate primary tillage."
+  ) +
+  theme_classic(base_size = 13) +
+  theme(
+    axis.text.x   = element_text(size = 8, angle = 45, hjust = 1),
+    plot.title    = element_text(hjust = 0.5),
+    plot.caption  = element_text(hjust = 0.5, size = 10, margin = margin(t = 4))
+  )
+
+p_pw3_sys_raw
+
+# Optional: save figure
+ggsave(
+  filename = here("figs", "analysis", "peak_weed_PW3_system_raw.png"),
+  plot     = p_pw3_sys_raw,
+  width    = 7.5,
+  height   = 4.5,
+  dpi      = 300
+)
+
+
+```
+## Model PW4 – No-till vs. any tilled system
+```{r}
+## 8) Model PW4 – No-till vs. any tilled system -------------------------
+
+# 8.1) Collapse to simple system factor ---------------------------------
+fsb_peak_simple <- fsb_peak_all |>
+  mutate(
+    system_simple = if_else(
+      primary_tillage == "No-till",
+      "No-till",
+      "Tilled"
+    ),
+    system_simple = factor(system_simple, levels = c("No-till", "Tilled"))
+  )
+
+# Sample sizes per simple system ----------------------------------------
+fsb_peak_simple |>
+  count(system_simple) |>
+  kable(
+    digits    = 0,
+    col.names = c("System", "n"),
+    caption   = "Sample size by simple system (No-till vs. Tilled)"
+  ) |>
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped", "hover")
+  )
+
+# 8.2) GLMM: peak weed biomass ~ simple system + random block ----------
+
+pw4_mod <- glmmTMB(
+  peak_weed_biomass_kg_ha ~ system_simple + (1 | block),
+  family = tweedie(link = "log"),
+  data   = fsb_peak_simple
+)
+
+car::Anova(pw4_mod, type = 3)
+
+# 8.3) Emmeans + contrast (No-till vs Tilled) ---------------------------
+
+emm_pw4 <- emmeans(pw4_mod, ~ system_simple, type = "response")
+
+# Use tidy_emm to standardize CI column names ---------------------------
+emm_pw4_df <- tidy_emm(
+  emm_pw4,
+  factor_col = "system_simple",
+  ref_levels = c("No-till", "Tilled")
+)
+
+# Table of mean ± 95% CI
+emm_pw4_df |>
+  select(system_simple, response, ci_low, ci_high) |>
+  kable(
+    digits    = 1,
+    col.names = c("System",
+                  "Peak weed biomass (kg ha⁻¹)",
+                  "Lower CI",
+                  "Upper CI"),
+    caption   = "Peak weed biomass by simple system (No-till vs. Tilled; model-estimated means ± 95% CI)"
+  ) |>
+  kable_styling(
+    full_width        = FALSE,
+    bootstrap_options = c("striped", "hover")
+  )
+
+# Pairwise contrast (Tilled – No-till on log scale; ratio on response scale)
+pw4_contrast <- contrast(emm_pw4, "revpairwise")
+summary(pw4_contrast, infer = TRUE, type = "response")
+
+# 8.4) Figure: simple system means ± 95% CI -----------------------------
+
+p_pw4_simple <- emm_pw4_df |>
+  ggplot(aes(x = system_simple, y = response, fill = system_simple)) +
+  geom_col(colour = "black", width = 0.6) +
+  geom_errorbar(aes(ymin = ci_low, ymax = ci_high), width = 0.15) +
+  scale_fill_manual(
+    values = c("No-till" = primary_tillage_cols["No-till"],
+               "Tilled"  = "grey60"),
+    guide  = "none"
+  ) +
+  scale_y_continuous(labels = scales::label_comma(), limits = c(0, NA)) +
+  labs(
+    x       = NULL,
+    y       = expression(Peak~weed~biomass~"(kg"~ha^{-1}*")"),
+    title   = "Peak weed biomass: No-till vs. tilled systems",
+    caption = "Bars show model-estimated means (kg ha\u207b\u00b9) ± 95% CI."
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    plot.title   = element_text(hjust = 0.5),
+    plot.caption = element_text(hjust = 0.5, size = 10, margin = margin(t = 4))
+  )
+
+p_pw4_simple
+
+ggsave(
+  filename = here("figs", "analysis", "peak_weed_PW4_simple_system.png"),
+  plot     = p_pw4_simple,
+  width    = 4.5,
+  height   = 4,
+  dpi      = 300
+)
+
+
+```
+
